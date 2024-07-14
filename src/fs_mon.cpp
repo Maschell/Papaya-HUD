@@ -1,233 +1,126 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <atomic>
-#include <cstdint>
 #include <cstdio>
-#include <memory>
-#include <new>
 
 #include <coreinit/filesystem.h>
 #include <coreinit/filesystem_fsa.h>
-#include <coreinit/messagequeue.h>
 
 #include <wups.h>
+#include <malloc.h>
 
 #include "fs_mon.hpp"
-#include "logging.hpp"
-
 
 namespace fs_mon {
-
     std::atomic_uint bytes_read = 0;
-    std::atomic_uint shim_bytes_read = 0;
-
-
-    void
-    initialize()
-    {
-        bytes_read = 0;
-        shim_bytes_read = 0;
-    }
-
+    std::atomic_uint bytes_written = 0;
+    std::atomic_uint read_count = 0;
+    std::atomic_uint write_count = 0;
 
     void
-    finalize()
-    {}
-
-
-    const char*
-    get_report(float dt)
-    {
-        static char buf[64];
-
-        const unsigned read = std::atomic_exchange(&bytes_read, 0u);
-        const float read_rate = read / (1024.0f * 1024.0f) / dt;
-
-        const unsigned shim_read = std::atomic_exchange(&shim_bytes_read, 0u);
-        const float shim_read_rate = shim_read / (1024.0f * 1024.0f) / dt;
-
-
-        std::snprintf(buf, sizeof buf,
-                      "read %.1f MiB/s | shim_read %.1f MiB/s",
-                      read_rate,
-                      shim_read_rate);
-        return buf;
+    initialize() {
+       bytes_read = 0;
+       bytes_written = 0;
+       read_count = 0;
+       write_count = 0;
     }
 
+    void
+    finalize() {}
+
+    const char *
+    get_report(float dt) {
+       static char buf[64];
+
+       const unsigned read = std::atomic_exchange(&bytes_read, 0u);
+       const float read_rate = read / (1024.0f * 1024.0f) / dt;
+       const unsigned write = std::atomic_exchange(&bytes_written, 0u);
+       const float write_rate = write / (1024.0f * 1024.0f) / dt;
+       const unsigned read_cnt = std::atomic_exchange(&read_count, 0u);
+       const float read_count_rate = read_cnt / dt;
+       const unsigned write_cnt = std::atomic_exchange(&write_count, 0u);
+       const float write_count_rate = write_cnt / dt;
+
+       std::snprintf(buf, sizeof buf,
+                     "read %.1f MiB/s | write %.1f MiB/s | reads %0.1f/s | writes %0.1f/s",
+                     read_rate,
+                     write_rate,
+                     read_count_rate,
+                     write_count_rate);
+       return buf;
+    }
 
 } // namespace fs_mon
 
+void CalcReadWriteInfo(FSAShimBuffer *shim, FSError res) {
+   if (res < 0) {
+      return;
+   }
 
-DECL_FUNCTION(FSStatus, FSReadFile,
-              FSCmdBlock *block,
-              uint8_t *buffer,
-              uint32_t size,
-              uint32_t count,
-              FSFileHandle handle,
-              uint32_t unk1,
-              FSErrorFlag errorMask)
-{
-    FSStatus result = real_FSReadFile(block, buffer, size, count, handle, unk1, errorMask);
-    if (result == FS_STATUS_OK)
-        fs_mon::bytes_read += size * count;
-    return result;
+   if (shim->command == FSA_COMMAND_RAW_READ) {
+      fs_mon::read_count++;
+      fs_mon::bytes_read += shim->request.rawRead.size * res;
+   } else if (shim->command == FSA_COMMAND_RAW_WRITE) {
+      fs_mon::write_count++;
+      fs_mon::bytes_written += shim->request.rawWrite.size * res;
+   } else if (shim->command == FSA_COMMAND_READ_FILE) {
+      fs_mon::read_count++;
+      fs_mon::bytes_read += shim->request.readFile.size * res;
+   } else if (shim->command == FSA_COMMAND_WRITE_FILE) {
+      fs_mon::write_count++;
+      fs_mon::bytes_written += shim->request.writeFile.size * res;
+   }
 }
 
-
-DECL_FUNCTION(FSStatus, FSReadFileAsync,
-              FSClient* client,
-              FSCmdBlock* block,
-              std::uint8_t* buffer,
-              std::uint32_t size,
-              std::uint32_t count,
-              FSFileHandle handle,
-              std::uint32_t unk1,
-              FSErrorFlag errorMask,
-              FSAsyncData* data)
-{
-    // sloppy measuring, we assume the read will succeed
-    fs_mon::bytes_read += size * count;
-    return real_FSReadFileAsync(client, block,
-                                buffer, size, count,
-                                handle, unk1, errorMask,
-                                data);
+DECL_FUNCTION(FSError, fsaShimSubmitRequest,
+              FSAShimBuffer *shim,
+              FSError emulatedError) {
+   auto res = real_fsaShimSubmitRequest(shim, emulatedError);
+   CalcReadWriteInfo(shim, res);
+   return res;
 }
 
+struct ReadFileContextWrapper {
+    IOSAsyncCallbackFn realCallback;
+    void *realContext;
+    FSAShimBuffer *shim;
+};
 
-DECL_FUNCTION(FSStatus, FSReadFileWithPos,
-              FSClient* client,
-              FSCmdBlock* block,
-              uint8_t* buffer,
-              uint32_t size,
-              uint32_t count,
-              uint32_t pos,
-              FSFileHandle handle,
-              uint32_t unk1,
-              FSErrorFlag errorMask)
-{
-    FSStatus result = real_FSReadFileWithPos(client, block,
-                                             buffer, size, count, pos,
-                                             handle, unk1, errorMask);
-    if (result == FS_STATUS_OK)
-        fs_mon::bytes_read += size * count;
-    return result;
+#define FSAShimDecodeIosErrorToFsaStatus     ((FSError (*)(IOSHandle  handle, IOSError error))(0x101C400 + 0x42bc4))
+
+void asyncCallbackTest(IOSError result, void *context) {
+   auto *wrapper = static_cast<ReadFileContextWrapper *>(context);
+   CalcReadWriteInfo(wrapper->shim, FSAShimDecodeIosErrorToFsaStatus(wrapper->shim->clientHandle, result));
+   if (wrapper->realCallback) {
+      wrapper->realCallback(result, wrapper->realContext);
+   }
+   free(wrapper);
 }
 
+DECL_FUNCTION(FSError, fsaShimSubmitRequestAsync, FSAShimBuffer *shim,
+              FSError emulatedError,
+              IOSAsyncCallbackFn callback,
+              void *context) {
+   if (shim->command != FSA_COMMAND_READ_FILE) {
+      return real_fsaShimSubmitRequestAsync(shim, emulatedError, callback, context);
+   }
+   auto *wrapper = static_cast<ReadFileContextWrapper *>(memalign(0x40, sizeof(ReadFileContextWrapper)));
+   if (!wrapper) {
+      return real_fsaShimSubmitRequestAsync(shim, emulatedError, callback, context);
+   }
+   *wrapper = {};
+   wrapper->realCallback = callback;
+   wrapper->realContext = context;
+   wrapper->shim = shim;
 
-DECL_FUNCTION(FSStatus, FSReadFileWithPosAsync,
-              FSClient* client,
-              FSCmdBlock* block,
-              uint8_t* buffer,
-              uint32_t size,
-              uint32_t count,
-              uint32_t pos,
-              FSFileHandle handle,
-              uint32_t unk1,
-              FSErrorFlag errorMask,
-              FSAsyncData* asyncData)
-{
-    // sloppy measuring, we assume the read will succeed
-    fs_mon::bytes_read += size * count;
-    return real_FSReadFileWithPosAsync(client, block,
-                                       buffer, size, count, pos,
-                                       handle, unk1, errorMask, asyncData);
+   auto result = real_fsaShimSubmitRequestAsync(shim, emulatedError, asyncCallbackTest, wrapper);
+   if (result != FS_ERROR_OK) {
+      free(wrapper);
+      return real_fsaShimSubmitRequestAsync(shim, emulatedError, callback, context);
+   }
+
+   return result;
 }
 
-
-DECL_FUNCTION(FSError, FSAReadFile,
-              FSAClientHandle client,
-              void* buffer,
-              uint32_t size,
-              uint32_t count,
-              FSAFileHandle handle,
-              uint32_t flags)
-{
-    FSError result = real_FSAReadFile(client, buffer, size, count, handle, flags);
-    if (result == FS_ERROR_OK)
-        fs_mon::bytes_read += size * count;
-    return result;
-}
-
-
-DECL_FUNCTION(FSError, FSAReadFileWithPos,
-              FSAClientHandle client,
-              void* buffer,
-              uint32_t size,
-              uint32_t count,
-              uint32_t pos,
-              FSAFileHandle handle,
-              uint32_t flags)
-{
-    FSError result = real_FSAReadFileWithPos(client, buffer, size, count, pos, handle, flags);
-    if (result == FS_ERROR_OK)
-        fs_mon::bytes_read += size * count;
-    return result;
-}
-
-
-DECL_FUNCTION(FSError, FSAReadFileAsync,
-              FSAClientHandle client,
-              void* buffer,
-              uint32_t size,
-              uint32_t count,
-              FSAFileHandle handle,
-              uint32_t flags,
-              void* asyncData)
-{
-    // sloppy measuring, we assume the read will succeed
-    fs_mon::bytes_read += size * count;
-    return real_FSAReadFileAsync(client, buffer, size, count, handle, flags, asyncData);
-}
-
-
-DECL_FUNCTION(FSError, FSAReadFileWithPosAsync,
-              FSAClientHandle client,
-              void* buffer,
-              uint32_t size,
-              uint32_t count,
-              uint32_t pos,
-              FSAFileHandle handle,
-              uint32_t flags,
-              void* asyncData)
-{
-    // sloppy measuring, we assume the read will succeed
-    fs_mon::bytes_read += size * count;
-    return real_FSAReadFileWithPosAsync(client,
-                                        buffer, size, count, pos,
-                                        handle, flags, asyncData);
-}
-
-
-WUPS_MUST_REPLACE(FSReadFile,             WUPS_LOADER_LIBRARY_COREINIT, FSReadFile);
-WUPS_MUST_REPLACE(FSReadFileAsync,        WUPS_LOADER_LIBRARY_COREINIT, FSReadFileAsync);
-WUPS_MUST_REPLACE(FSReadFileWithPos,      WUPS_LOADER_LIBRARY_COREINIT, FSReadFileWithPos);
-WUPS_MUST_REPLACE(FSReadFileWithPosAsync, WUPS_LOADER_LIBRARY_COREINIT, FSReadFileWithPosAsync);
-
-WUPS_MUST_REPLACE(FSAReadFile,             WUPS_LOADER_LIBRARY_COREINIT, FSAReadFile);
-WUPS_MUST_REPLACE(FSAReadFileAsync,        WUPS_LOADER_LIBRARY_COREINIT, FSAReadFileAsync);
-WUPS_MUST_REPLACE(FSAReadFileWithPos,      WUPS_LOADER_LIBRARY_COREINIT, FSAReadFileWithPos);
-WUPS_MUST_REPLACE(FSAReadFileWithPosAsync, WUPS_LOADER_LIBRARY_COREINIT, FSAReadFileWithPosAsync);
-
-
-
-DECL_FUNCTION(FSError, fsaShimPrepareRequestReadFile,
-              FSAShimBuffer* shim,
-              IOSHandle client,
-              uint8_t* buffer,
-              uint32_t size,
-              uint32_t count,
-              FSAFilePosition pos,
-              FSAFileHandle handle,
-              FSAReadFlag flags)
-{
-    // sloppy measuring, we assume the read will succeed
-    fs_mon::shim_bytes_read += size * count;
-    return real_fsaShimPrepareRequestReadFile(shim, client,
-                                              buffer, size, count, pos,
-                                              handle, flags);
-}
-
-
-WUPS_MUST_REPLACE_PHYSICAL(fsaShimPrepareRequestReadFile,
-                           (0x020436cc + 0x3001c400),
-                           (0x020436cc - 0xfe3c00));
+WUPS_MUST_REPLACE_PHYSICAL(fsaShimSubmitRequest, (0x02042d90 + 0x3001c400), (0x02042d90 - 0xfe3c00));
+WUPS_MUST_REPLACE_PHYSICAL(fsaShimSubmitRequestAsync, (0x02042e84 + 0x3001c400), (0x02042e84 - 0xfe3c00));
